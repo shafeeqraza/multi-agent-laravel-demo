@@ -2,49 +2,50 @@
 
 namespace App\Ai\Agents;
 
-use App\Models\Coupon;
+use App\Ai\Concerns\DecodesAgentResponse;
+use App\Ai\Concerns\ResolvesChatAiTextProviders;
+use App\Ai\Tools\CouponTool;
 use Illuminate\Contracts\JsonSchema\JsonSchema;
 use Illuminate\Support\Facades\Validator;
 use InvalidArgumentException;
+use Laravel\Ai\Contracts\Agent;
+use Laravel\Ai\Contracts\HasStructuredOutput;
+use Laravel\Ai\Promptable;
 
-use function Laravel\Ai\agent;
-
-class CouponAgent
+class CouponAgent implements Agent, HasStructuredOutput
 {
-    private const FALLBACK_CODE = 'WELCOME10';
+    use DecodesAgentResponse, Promptable, ResolvesChatAiTextProviders;
 
-    private const FALLBACK_DISCOUNT = '10%';
+    public function __construct(private CouponTool $couponTool) {}
 
     /**
-     * @return array{code: string, discount: string}
+     * @param  array<string, mixed>  $params
+     * @return array{code: string, discount: string, message: string}
+     */
+    public function run(array $params): array
+    {
+        return $this->handle();
+    }
+
+    /**
+     * @return array{code: string, discount: string, message: string}
      */
     public function handle(): array
     {
-        $coupon = Coupon::query()
-            ->where('is_active', true)
-            ->where(function ($query) {
-                $query->whereNull('expires_at')
-                    ->orWhere('expires_at', '>', now());
-            })
-            ->inRandomOrder()
-            ->first();
+        $couponData = $this->couponTool->resolveCoupon();
 
-        $code = $coupon?->code ?? self::FALLBACK_CODE;
-        $discount = $coupon ? (string) $coupon->discount : self::FALLBACK_DISCOUNT;
+        $response = $this->prompt($this->buildPrompt($couponData['code'], $couponData['discount']), provider: $this->chatAiTextProviders());
 
-        $response = agent(
-            instructions: $this->instructions(),
-            schema: fn (JsonSchema $schema) => [
-                'code' => $schema->string()->required(),
-                'discount' => $schema->string()->required(),
-            ],
-        )->prompt($this->buildPrompt($code, $discount), provider: 'gemini');
-
-        $payload = $this->decodeResponse($response);
+        $payload = $this->decodeResponse(
+            response: $response,
+            emptyErrorMessage: 'Empty coupon agent response.',
+            jsonErrorMessage: 'Invalid JSON from coupon agent.',
+        );
 
         $validator = Validator::make($payload, [
             'code' => ['required', 'string'],
             'discount' => ['required', 'string'],
+            'message' => ['required', 'string'],
         ]);
 
         if ($validator->fails()) {
@@ -54,42 +55,14 @@ class CouponAgent
         $validated = $validator->validated();
 
         logger()->info('coupon-agent.handle', [
-            'coupon_found' => $coupon !== null,
+            'coupon_found' => $couponData['coupon_found'],
             'payload' => $validated,
         ]);
 
         return $validated;
     }
 
-    /**
-     * @return array{code: string, discount: string}
-     */
-    protected function decodeResponse(mixed $response): array
-    {
-        if (is_array($response)) {
-            return $response;
-        }
-
-        $content = trim((string) $response);
-
-        if ($content === '') {
-            throw new InvalidArgumentException('Empty coupon agent response.');
-        }
-
-        try {
-            $decoded = json_decode($content, true, 512, JSON_THROW_ON_ERROR);
-        } catch (\JsonException) {
-            throw new InvalidArgumentException('Invalid JSON from coupon agent.');
-        }
-
-        if (! is_array($decoded)) {
-            throw new InvalidArgumentException('Invalid response payload type.');
-        }
-
-        return $decoded;
-    }
-
-    protected function instructions(): string
+    public function instructions(): string
     {
         return <<<'PROMPT'
 You are a discount and promotions assistant for an e-commerce system.
@@ -99,13 +72,27 @@ No explanations, markdown, or extra text.
 Required JSON shape:
 {
   "code": "string",
-  "discount": "string"
+  "discount": "string",
+  "message": "string"
 }
 
 Rules:
 - Return the exact coupon code and discount value provided to you.
 - Do not invent or modify coupon codes or discount values.
+- message must be one or two friendly sentences for the customer that include the exact code and discount strings above.
 PROMPT;
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    public function schema(JsonSchema $schema): array
+    {
+        return [
+            'code' => $schema->string()->required(),
+            'discount' => $schema->string()->required(),
+            'message' => $schema->string()->required(),
+        ];
     }
 
     protected function buildPrompt(string $code, string $discount): string

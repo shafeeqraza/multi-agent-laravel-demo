@@ -2,153 +2,88 @@
 
 namespace App\Ai\Agents;
 
+use App\Ai\Tools\CheckAuthenticationTool;
+use App\Ai\Tools\GetRecentOrdersTool;
+use App\Ai\Tools\ResolveOrderReferenceTool;
 use Illuminate\Contracts\JsonSchema\JsonSchema;
-use Illuminate\Support\Arr;
-use Illuminate\Support\Facades\Validator;
-use InvalidArgumentException;
+use Illuminate\Support\Stringable;
+use Laravel\Ai\Concerns\RemembersConversations;
+use Laravel\Ai\Contracts\Agent;
+use Laravel\Ai\Contracts\HasStructuredOutput;
+use Laravel\Ai\Contracts\HasTools;
+use Laravel\Ai\Contracts\Tool;
+use Laravel\Ai\Promptable;
 
-use function Laravel\Ai\agent;
-
-class OrchestratorAgent
+class OrchestratorAgent implements Agent, HasStructuredOutput, HasTools
 {
-    /**
-     * @return array{action: string, parameters: array{order_id: ?string}}
-     */
-    public function route(string $userInput): array
-    {
-        $response = agent(
-            instructions: $this->routingInstructions(),
-            schema: fn (JsonSchema $schema) => [
-                'action' => $schema->string()->required(),
-                'parameters' => $schema->object([
-                    'order_id' => $schema->string()->required(),
-                ])->required(),
-            ],
-        )->prompt($userInput, provider: 'gemini');
+    use Promptable;
+    use RemembersConversations;
 
-        $payload = $this->normalizeRoutingPayload($response);
-
-        logger()->info('orchestrator.route', [
-            'user_input' => $userInput,
-            'payload' => $payload,
-        ]);
-
-        return $payload;
-    }
-
-    public function finalize(array $agentResult): string
-    {
-        $response = agent(
-            instructions: $this->finalizeInstructions(),
-        )->prompt(json_encode($agentResult, JSON_THROW_ON_ERROR), provider: 'gemini');
-
-        $text = trim((string) $response);
-
-        logger()->info('orchestrator.finalize', [
-            'result' => $agentResult,
-            'message' => $text,
-        ]);
-
-        return $text !== '' ? $text : 'I could not format a response.';
-    }
-
-    /**
-     * @return array{action: string, parameters: array{order_id: ?string}}
-     */
-    protected function normalizeRoutingPayload(mixed $response): array
-    {
-        $decoded = $this->decodeResponse($response);
-
-        $payload = [
-            'action' => Arr::get($decoded, 'action'),
-            'parameters' => [
-                'order_id' => $this->normalizeOrderId(Arr::get($decoded, 'parameters.order_id')),
-            ],
-        ];
-
-        $validator = Validator::make($payload, [
-            'action' => ['required', 'string', 'in:order_status,return_request,discount_check'],
-            'parameters' => ['required', 'array'],
-            'parameters.order_id' => ['nullable', 'string'],
-        ]);
-
-        if ($validator->fails()) {
-            throw new InvalidArgumentException('Invalid orchestrator response.');
-        }
-
-        return $validator->validated();
-    }
-
-    /**
-     * @return array<string, mixed>
-     */
-    protected function decodeResponse(mixed $response): array
-    {
-        if (is_array($response)) {
-            return $response;
-        }
-
-        $content = trim((string) $response);
-
-        if ($content === '') {
-            return [];
-        }
-
-        try {
-            $decoded = json_decode($content, true, 512, JSON_THROW_ON_ERROR);
-        } catch (\JsonException) {
-            return [];
-        }
-
-        return is_array($decoded) ? $decoded : [];
-    }
-
-    protected function normalizeOrderId(mixed $value): ?string
-    {
-        if (! is_string($value)) {
-            return null;
-        }
-
-        $normalized = trim($value);
-
-        if ($normalized === '' || strtolower($normalized) === 'null') {
-            return null;
-        }
-
-        return $normalized;
-    }
-
-    protected function routingInstructions(): string
+    public function instructions(): Stringable|string
     {
         return <<<'PROMPT'
-You are an orchestration agent for an e-commerce assistant.
-Return valid JSON only.
-No prose, no markdown, no explanations.
+You are a customer-support orchestrator for an e-commerce assistant. Output STRICT JSON only—no markdown, no prose outside the JSON object.
 
-Output shape:
+Available actions (choose exactly one):
+- order_status — tracking, shipment, or status for a specific order, or after resolving the user’s order context when authenticated.
+- return_request — returns or refunds.
+- discount_check — coupons or discounts.
+- auth_required — the user needs to log in before you can help with their order history or past purchases.
+
+Tools (use only as instructed):
+- check_authentication — returns {"authenticated": true|false} for the current session.
+- get_recent_orders — lists recent orders for the logged-in customer only.
+- resolve_order_reference — arguments: reference (user text), day (empty string unless they mention a weekday; then a valid token: monday, tue, friday, etc.). Maps “latest/last order” or purchases on the last occurrence of that weekday to an order id when logged in.
+
+Region capabilities:
+- Each user message may be prefixed with JSON listing enabled flows: order_status, return_request, discount_check. Never choose a disabled action. auth_required is allowed whenever the user needs account access for order history.
+
+Authentication and order history (critical):
+1. If the user asks for anything that implies their own order history or past purchases without a concrete order id—e.g. “latest order”, “recent order”, “last order”, “previous purchase”, “order history”, “what I bought last Friday”—you MUST call check_authentication first.
+2. If authenticated is false: do NOT call get_recent_orders or resolve_order_reference. Output action auth_required with parameters.message set to a short, polite line asking them to log in so you can access their orders (e.g. “Please log in first so I can access your recent orders.”). Set parameters.order_id and parameters.coupon_code to empty strings.
+3. If authenticated is true: you may call get_recent_orders and/or resolve_order_reference to obtain order context. Never invent or guess orders for guests or for other users. Use only tool results for that customer’s data.
+4. If the user provides an explicit order id or order number and is asking for status only, you may choose order_status without listing tools in your reasoning, unless you still need fuzzy resolution (then authenticate first, then resolve_order_reference if needed).
+
+Other rules:
+- For order_status: set parameters.order_id to the order number or id string when known; otherwise empty string.
+- For discount_check: put any coupon code in parameters.coupon_code; otherwise empty string.
+- For auth_required: parameters.message is required user-facing text; parameters.order_id and parameters.coupon_code are empty strings.
+- Always include all three parameter keys: order_id, message, coupon_code (use empty string when not applicable).
+- Do not answer the user in free text; only output the JSON object below.
+
+Output shape (exact keys):
 {
-  "action": "order_status | return_request | discount_check",
+  "action": "order_status | return_request | discount_check | auth_required",
   "parameters": {
-    "order_id": "string|null"
+    "order_id": "string (empty if unknown)",
+    "message": "string (empty except for auth_required)",
+    "coupon_code": "string (empty if unknown)"
   }
 }
-
-Rules:
-- Determine the single best action from the allowed values.
-- Extract order_id from user input when present.
-- If no order_id exists, set order_id to null.
-- Return only valid JSON.
 PROMPT;
     }
 
-    protected function finalizeInstructions(): string
+    /**
+     * @return iterable<int, Tool>
+     */
+    public function tools(): iterable
     {
-        return <<<'PROMPT'
-You are a customer-facing e-commerce assistant.
-You will receive JSON data.
-Write one short, natural response for the customer.
-Do not invent values.
-If data is missing, politely ask for what is needed.
-PROMPT;
+        return [
+            new CheckAuthenticationTool(auth()->check()),
+            new GetRecentOrdersTool((int) (auth()->id() ?? 0)),
+            new ResolveOrderReferenceTool((int) (auth()->id() ?? 0)),
+        ];
+    }
+
+    public function schema(JsonSchema $schema): array
+    {
+        return [
+            'action' => $schema->string()->required(),
+            'parameters' => $schema->object([
+                'order_id' => $schema->string()->required(),
+                'message' => $schema->string()->required(),
+                'coupon_code' => $schema->string()->required(),
+            ])->withoutAdditionalProperties()->required(),
+        ];
     }
 }

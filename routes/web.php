@@ -21,8 +21,8 @@ Route::middleware(['auth'])->group(function () {
 });
 
 Route::view('/chat', 'chat')->name('chat.form');
-Route::post('/chat', ChatController::class)->name('chat');
+Route::post('/chat', ChatController::class)
+    ->middleware('chat.timeout')
+    ->name('chat');
 
-Route::get('test', fn () => [env('DB_CONNECTION'), env('DB_HOST'), env('DB_PORT'), env('DB_DATABASE'), env('DB_USERNAME'), env('DB_PASSWORD')]);
-
-require __DIR__.'/auth.php';
+require __DIR__ . '/auth.php';

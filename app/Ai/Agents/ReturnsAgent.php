@@ -2,16 +2,32 @@
 
 namespace App\Ai\Agents;
 
-use App\Models\ReturnRequest;
+use App\Ai\Concerns\DecodesAgentResponse;
+use App\Ai\Concerns\ResolvesChatAiTextProviders;
+use App\Ai\Tools\ReturnRequestTool;
 use Illuminate\Contracts\JsonSchema\JsonSchema;
 use Illuminate\Support\Facades\Validator;
 use InvalidArgumentException;
+use Laravel\Ai\Contracts\Agent;
+use Laravel\Ai\Contracts\HasStructuredOutput;
+use Laravel\Ai\Promptable;
 
-use function Laravel\Ai\agent;
-
-class ReturnsAgent
+class ReturnsAgent implements Agent, HasStructuredOutput
 {
-    private const RETURN_WINDOW_DAYS = 7;
+    use DecodesAgentResponse, Promptable, ResolvesChatAiTextProviders;
+
+    public function __construct(private ReturnRequestTool $returnRequestTool) {}
+
+    /**
+     * @param  array<string, mixed>  $params
+     * @return array{eligible: bool, message: string}
+     */
+    public function run(array $params): array
+    {
+        return $this->handle([
+            'order_id' => (string) ($params['order_id'] ?? ''),
+        ]);
+    }
 
     /**
      * @param  array{order_id: string}  $input
@@ -28,25 +44,19 @@ class ReturnsAgent
         }
 
         $orderId = $input['order_id'];
-        $eligible = $this->checkReturnEligibility($orderId);
+        $eligible = $this->returnRequestTool->isEligible($orderId);
 
         if ($eligible) {
-            ReturnRequest::query()->create([
-                'order_id' => $orderId,
-                'status' => 'pending',
-                'requested_at' => now(),
-            ]);
+            $this->returnRequestTool->createPending($orderId);
         }
 
-        $response = agent(
-            instructions: $this->instructions(),
-            schema: fn (JsonSchema $schema) => [
-                'eligible' => $schema->boolean()->required(),
-                'message' => $schema->string()->required(),
-            ],
-        )->prompt($this->buildPrompt($orderId, $eligible), provider: 'gemini');
+        $response = $this->prompt($this->buildPrompt($orderId, $eligible), provider: $this->chatAiTextProviders());
 
-        $payload = $this->decodeResponse($response);
+        $payload = $this->decodeResponse(
+            response: $response,
+            emptyErrorMessage: 'Empty returns agent response.',
+            jsonErrorMessage: 'Invalid JSON from returns agent.',
+        );
 
         $resultValidator = Validator::make($payload, [
             'eligible' => ['required', 'boolean'],
@@ -68,49 +78,7 @@ class ReturnsAgent
         return $validated;
     }
 
-    protected function checkReturnEligibility(string $orderId): bool
-    {
-        $existingRequest = ReturnRequest::query()
-            ->where('order_id', $orderId)
-            ->latest('requested_at')
-            ->first();
-
-        if (! $existingRequest) {
-            return false;
-        }
-
-        return $existingRequest->requested_at->diffInDays(now()) <= self::RETURN_WINDOW_DAYS;
-    }
-
-    /**
-     * @return array{eligible: bool, message: string}
-     */
-    protected function decodeResponse(mixed $response): array
-    {
-        if (is_array($response)) {
-            return $response;
-        }
-
-        $content = trim((string) $response);
-
-        if ($content === '') {
-            throw new InvalidArgumentException('Empty returns agent response.');
-        }
-
-        try {
-            $decoded = json_decode($content, true, 512, JSON_THROW_ON_ERROR);
-        } catch (\JsonException) {
-            throw new InvalidArgumentException('Invalid JSON from returns agent.');
-        }
-
-        if (! is_array($decoded)) {
-            throw new InvalidArgumentException('Invalid response payload type.');
-        }
-
-        return $decoded;
-    }
-
-    protected function instructions(): string
+    public function instructions(): string
     {
         return <<<'PROMPT'
 You are a returns and refunds assistant for an e-commerce system.
@@ -127,6 +95,17 @@ Rules:
 - If eligible is true, message must be: "Return request created successfully"
 - If eligible is false, message must be: "Return window has expired"
 PROMPT;
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    public function schema(JsonSchema $schema): array
+    {
+        return [
+            'eligible' => $schema->boolean()->required(),
+            'message' => $schema->string()->required(),
+        ];
     }
 
     protected function buildPrompt(string $orderId, bool $eligible): string

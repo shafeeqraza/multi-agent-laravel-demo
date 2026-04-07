@@ -2,52 +2,51 @@
 
 namespace App\Ai\Agents;
 
-use App\Models\Order;
+use App\Ai\Concerns\DecodesAgentResponse;
+use App\Ai\Concerns\ResolvesChatAiTextProviders;
+use App\Ai\Tools\OrderStatusTool;
 use Illuminate\Contracts\JsonSchema\JsonSchema;
 use Illuminate\Support\Facades\Validator;
 use InvalidArgumentException;
+use Laravel\Ai\Contracts\Agent;
+use Laravel\Ai\Contracts\HasStructuredOutput;
+use Laravel\Ai\Promptable;
 
-use function Laravel\Ai\agent;
-
-class OrderStatusAgent
+class OrderStatusAgent implements Agent, HasStructuredOutput
 {
-    /**
-     * @return array{status: string, estimated_delivery: string}
-     */
-    public function handle(string $orderId): array
-    {
-        $order = Order::where('order_number', $orderId)->first();
+    use DecodesAgentResponse, Promptable, ResolvesChatAiTextProviders;
 
-        if (! $order) {
-            logger()->info('order-status.not-found', ['order_id' => $orderId]);
+    public function __construct(private OrderStatusTool $orderStatusTool) {}
+
+    /**
+     * @return array{status: string, estimated_delivery: string, message: string}
+     */
+    public function run(array $params): array
+    {
+        $orderData = $this->orderStatusTool->findByOrderNumber($params['order_id']);
+
+        if (! $orderData) {
+            logger()->info('order-status.not-found', ['order_id' => $params['order_id']]);
 
             return [
                 'status' => 'not_found',
                 'estimated_delivery' => now()->addDays(7)->format('Y-m-d'),
+                'message' => 'We could not find an order with that number. Please double-check the order ID and try again.',
             ];
         }
 
-        $orderData = [
-            'order_number' => $order->order_number,
-            'customer_name' => $order->customer_name,
-            'status' => $order->status,
-            'estimated_delivery' => $order->getRawOriginal('estimated_delivery'),
-            'total_amount' => (float) $order->total_amount,
-        ];
+        $response = $this->prompt($this->buildPrompt($orderData), provider: $this->chatAiTextProviders());
 
-        $response = agent(
-            instructions: $this->instructions(),
-            schema: fn (JsonSchema $schema) => [
-                'status' => $schema->string()->required(),
-                'estimated_delivery' => $schema->string()->required(),
-            ],
-        )->prompt($this->buildPrompt($orderData), provider: 'gemini');
-
-        $payload = $this->decodeResponse($response);
+        $payload = $this->decodeResponse(
+            response: $response,
+            emptyErrorMessage: 'Empty order status response.',
+            jsonErrorMessage: 'Invalid JSON from order status agent.',
+        );
 
         $validator = Validator::make($payload, [
             'status' => ['required', 'string'],
-            'estimated_delivery' => ['required', 'date_format:Y-m-d'],
+            'estimated_delivery' => ['nullable', 'date_format:Y-m-d'],
+            'message' => ['required', 'string'],
         ]);
 
         if ($validator->fails()) {
@@ -55,42 +54,14 @@ class OrderStatusAgent
         }
 
         logger()->info('order-status.handle', [
-            'order_id' => $orderId,
+            'order_id' => $params['order_id'],
             'payload' => $payload,
         ]);
 
         return $validator->validated();
     }
 
-    /**
-     * @return array{status: string, estimated_delivery: string}
-     */
-    protected function decodeResponse(mixed $response): array
-    {
-        if (is_array($response)) {
-            return $response;
-        }
-
-        $content = trim((string) $response);
-
-        if ($content === '') {
-            throw new InvalidArgumentException('Empty order status response.');
-        }
-
-        try {
-            $decoded = json_decode($content, true, 512, JSON_THROW_ON_ERROR);
-        } catch (\JsonException) {
-            throw new InvalidArgumentException('Invalid JSON from order status agent.');
-        }
-
-        if (! is_array($decoded)) {
-            throw new InvalidArgumentException('Invalid response payload type.');
-        }
-
-        return $decoded;
-    }
-
-    protected function instructions(): string
+    public function instructions(): string
     {
         return <<<'PROMPT'
 You are an order status assistant for an e-commerce system.
@@ -101,14 +72,28 @@ Do NOT invent, assume, or hallucinate any values.
 Required JSON shape:
 {
   "status": "string",
-  "estimated_delivery": "YYYY-MM-DD"
+  "estimated_delivery": "YYYY-MM-DD",
+  "message": "string"
 }
 
 Rules:
 - Copy the status and estimated_delivery exactly from the provided order data.
 - estimated_delivery must always be a valid YYYY-MM-DD date string.
-- Return only valid JSON, no prose or markdown.
+- message must be a short, customer-facing sentence that reflects only those facts (order status and delivery date). Do not invent details.
+- Return only valid JSON, no prose or markdown outside the JSON.
 PROMPT;
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    public function schema(JsonSchema $schema): array
+    {
+        return [
+            'status' => $schema->string()->required(),
+            'estimated_delivery' => $schema->string()->required(),
+            'message' => $schema->string()->required(),
+        ];
     }
 
     /**

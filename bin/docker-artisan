@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Run Artisan inside the Compose app container (correct PHP / extensions / .env).
+set -euo pipefail
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$root"
+exec docker compose exec -T app php artisan "$@"
